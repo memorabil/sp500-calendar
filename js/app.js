@@ -343,8 +343,8 @@
 
     const result = await window.MarketAPI.loadEvents({
       useCache: !force,
-      onProgress: (i, total, ticker) => {
-        $statusText.textContent = `Fetching ${ticker} (${i}/${total})…`;
+      onProgress: (msg) => {
+        $statusText.textContent = msg;
       }
     });
 
@@ -354,17 +354,12 @@
     allEvents.sort((a, b) => new Date(a.date) - new Date(b.date));
 
     let sourceLabel = "";
-    if (result.source === "cache") sourceLabel = " · cached";
-    else if (result.source === "live") sourceLabel = " · live data";
-    else if (result.source === "demo") sourceLabel = " · demo data (live API blocked)";
+    if (result.source === "cache") sourceLabel = " · cached (24h)";
+    else if (result.source === "live") sourceLabel = " · Alpha Vantage live";
+    else if (result.source === "demo") sourceLabel = " · demo data (API rate-limited or blocked)";
 
     renderTimeline();
-    if (result.source === "demo") {
-      // Augment status with note about demo
-      $statusText.textContent += " · using demo data — live Yahoo API may be blocked by CORS";
-    } else {
-      $statusText.textContent += sourceLabel;
-    }
+    $statusText.textContent += sourceLabel;
   }
 
   /* ---------- Wire up UI ---------- */

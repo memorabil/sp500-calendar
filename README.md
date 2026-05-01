@@ -2,7 +2,7 @@
 
 A clean, iOS-inspired calendar that aggregates **earnings reports**, **ex-dividend dates**, **dividend payments**, **stock splits**, and **IPOs** for S&P 500 companies — all sorted chronologically and color-coded by event type.
 
-> Pure HTML/CSS/JS. No build step. No backend. Just open `index.html` or deploy to GitHub Pages.
+> Pure HTML/CSS/JS. No build step. No backend. Powered by **Alpha Vantage**. Just open `index.html` or deploy to GitHub Pages.
 
 ---
 
@@ -12,10 +12,10 @@ A clean, iOS-inspired calendar that aggregates **earnings reports**, **ex-divide
 - 🎨 **Color-coded by type** — earnings (red), ex-dividend (green), dividend payment (blue), splits (purple), IPOs (orange)
 - 🔍 **Filter by event type** — tap a chip to see only earnings, only dividends, etc.
 - 🔎 **Search** — by ticker (`AAPL`) or company name (`Tesla`)
-- 📊 **Estimates vs actuals** — for past earnings, see EPS beat/miss with percentage
+- 📊 **Estimates vs actuals** — for past earnings, see EPS beat/miss with percentage and surprise %
 - 📱 **iOS aesthetic** — sheet-style detail view, blur header, smooth animations, dark mode support
-- 🌐 **Live data** — pulls from Yahoo Finance (via CORS proxies); cached for 6 hours
-- 🛟 **Demo fallback** — if live API is blocked, automatically uses realistic mock data so the UI is always functional
+- 🌐 **Live data** — pulls from Alpha Vantage (your API key is already wired in); cached for 24 hours
+- 🛟 **Demo fallback** — if API is blocked or rate-limited, automatically uses realistic mock data
 
 ---
 
@@ -42,6 +42,27 @@ python3 -m http.server 8000
 
 ---
 
+## 🔑 API Key
+
+Your Alpha Vantage API key is already configured in `js/api.js`:
+
+```js
+const API_KEY = "RLO2OFNKRE8PNDEY";
+```
+
+**⚠️ Security note:** Because this is a frontend-only app, the API key is visible in the browser. That's acceptable for personal use, but **don't reuse this key for anything sensitive**. If you ever need to rotate it, get a new key at https://www.alphavantage.co/support/#api-key and replace it in `js/api.js`.
+
+### Free tier limits
+Alpha Vantage free tier: **25 API calls per day** and **5 per minute**. To stay within these:
+
+- **Bulk endpoints used first.** `EARNINGS_CALENDAR` and `IPO_CALENDAR` each return hundreds of events in a single call.
+- **24-hour cache.** Once data is loaded, it's stored in `localStorage` for 24 hours. Hit the refresh button (top right) only when you need fresh data.
+- **Per-ticker calls limited.** Dividend dates and past-earnings actuals require per-ticker calls. The app limits these to ~14 tickers per refresh (8 dividends + 6 past earnings) — tune `DIVIDEND_ENRICH_LIMIT` and `PAST_EARNINGS_ENRICH_LIMIT` in `js/api.js` if needed.
+
+A full refresh uses ~16 of your 25 daily calls. Use the refresh button sparingly.
+
+---
+
 ## 📂 Project Structure
 
 ```
@@ -50,11 +71,13 @@ sp500-calendar/
 ├── css/
 │   └── styles.css      # iOS-inspired styling, dark mode
 ├── js/
-│   ├── api.js          # Data layer (Yahoo Finance + fallback)
+│   ├── api.js          # Alpha Vantage data layer + 24h cache
 │   └── app.js          # UI rendering & interaction
 ├── data/
 │   └── sp500.js        # S&P 500 ticker list (~110 top names)
-└── README.md
+├── README.md
+├── LICENSE
+└── .gitignore
 ```
 
 ---
@@ -73,34 +96,43 @@ sp500-calendar/
 
 ## 🔧 How the data works
 
-The app tries to fetch real data from **Yahoo Finance** via three rotating CORS proxies (browsers can't hit Yahoo directly because of CORS). Results are cached in `localStorage` for 6 hours.
+The app calls Alpha Vantage in this order:
 
-### If the live API is blocked
-Public CORS proxies are rate-limited and sometimes go down. When that happens, the app **automatically falls back to realistic demo data** so you always see a working UI. The status bar will show "demo data (live API blocked)".
+1. **`EARNINGS_CALENDAR`** — one call returns all upcoming earnings for the next 3 months. Filtered to S&P 500 tickers only.
+2. **`IPO_CALENDAR`** — one call returns all upcoming IPOs.
+3. **`EARNINGS`** (per ticker, top 6) — for recently-reported earnings, fetches actual EPS so the app can show **beat/miss vs estimates** with surprise %.
+4. **`OVERVIEW`** (per ticker, top 8) — fetches `ExDividendDate` and `DividendDate` for the largest S&P 500 names.
 
-### To use a real API key (optional upgrade)
-For production-grade reliability, swap to a free API like:
-- [Finnhub](https://finnhub.io/) — generous free tier, earnings calendar endpoint
-- [Alpha Vantage](https://www.alphavantage.co/) — free tier with rate limits
-- [Polygon.io](https://polygon.io/) — free tier for end-of-day data
-
-Open `js/api.js` and add your fetcher in `loadEvents()`.
+All requests go through a CORS-proxy chain because Alpha Vantage doesn't allow direct browser calls in all environments. If proxies are unavailable, the app falls back to demo data.
 
 ---
 
 ## 🧩 Customizing
 
 ### Add more tickers
-Edit `data/sp500.js` and append objects of the form:
+Edit `data/sp500.js` and append:
 ```js
 { ticker: "TICKER", name: "Company Name" }
 ```
 
-### Change colors
-All colors are CSS variables in `css/styles.css` under `:root`. Look for `--c-earnings`, `--c-ex-dividend`, etc.
+### Pull dividends for more tickers
+Open `js/api.js` and increase:
+```js
+const DIVIDEND_ENRICH_LIMIT = 8;        // ↑ to 15, 20, etc.
+const PAST_EARNINGS_ENRICH_LIMIT = 6;
+```
+**Note:** each increment uses 1 more daily API call. Stay below ~20 total.
 
-### Change the time window
-Currently shows everything the API returns (typically next earnings date + dividend dates). To restrict to "next 30 days" only, filter `allEvents` in `js/app.js` after loading.
+### Change colors
+All event colors are CSS variables in `css/styles.css` under `:root`:
+```css
+--c-earnings: #ff453a;
+--c-ex-dividend: #30d158;
+/* etc. */
+```
+
+### Force a refresh
+Tap the **circular refresh icon** in the header. It clears the cache and re-fetches.
 
 ---
 
@@ -112,10 +144,10 @@ Automatic — follows your system preference (`prefers-color-scheme: dark`).
 
 ## 📝 Tech notes
 
-- **No dependencies, no build.** Loads two Google Fonts (Fraunces for headings, Inter for body). Everything else is vanilla.
-- **Caching:** 6-hour TTL in `localStorage`. Hit the refresh button (top right) to force a refetch.
+- **No dependencies, no build.** Loads two Google Fonts (Fraunces for headings, Inter for body).
+- **Caching:** 24-hour TTL in `localStorage` to respect the free tier.
 - **Sheet UX:** swipe-down to dismiss on mobile, ESC key on desktop, tap backdrop to close.
-- **Accessibility:** keyboard navigation, ARIA roles on the sheet, color contrast meets WCAG AA on key text.
+- **Accessibility:** keyboard navigation, ARIA roles on the sheet.
 
 ---
 
@@ -123,9 +155,9 @@ Automatic — follows your system preference (`prefers-color-scheme: dark`).
 
 - [ ] Calendar grid view (month at a glance)
 - [ ] iCal export — `.ics` file you can subscribe to
-- [ ] Push notifications (PWA install + service worker)
 - [ ] Personal watchlist (filter by user-saved tickers)
-- [ ] Historical earnings chart per ticker
+- [ ] Stock-split data (Alpha Vantage doesn't have a bulk splits endpoint — would need a different source)
+- [ ] Move API key to a serverless proxy for true security (e.g. Cloudflare Worker)
 
 ---
 

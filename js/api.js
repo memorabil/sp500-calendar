@@ -1,23 +1,34 @@
 /* ============================================
-   Data layer
-   - Tries Yahoo Finance (via CORS proxy)
-   - Falls back to realistic mock data
-   - Caches in localStorage for 6 hours
+   Data layer — Alpha Vantage
+   - Uses bulk endpoints (1 request per data type)
+   - Earnings: EARNINGS_CALENDAR (CSV, all upcoming)
+   - IPOs:     IPO_CALENDAR (CSV, all upcoming)
+   - Dividends: OVERVIEW per ticker (limited subset due to API quota)
+   - Past earnings (for actuals): EARNINGS per ticker (limited subset)
+   - Caches 24h in localStorage to respect 25 req/day free tier
    ============================================ */
 
 (function () {
-  const CACHE_KEY = "sp500_calendar_cache_v1";
-  const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+  /* ---------- CONFIG ---------- */
+  // Your Alpha Vantage API key
+  const API_KEY = "RLO2OFNKRE8PNDEY";
 
-  // Public CORS proxies — fallback chain. Yahoo blocks direct browser calls.
-  // We try several so the app keeps working if one is rate-limited.
+  const CACHE_KEY = "sp500_av_cache_v1";
+  const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours (respect free-tier 25/day)
+
+  // Alpha Vantage CORS — proxy chain fallback
   const CORS_PROXIES = [
     "https://api.allorigins.win/raw?url=",
     "https://corsproxy.io/?",
     "https://api.codetabs.com/v1/proxy?quest="
   ];
 
-  /* ---------- Cache helpers ---------- */
+  // For dividend & past-earnings enrichment, only pull top N tickers
+  // (each ticker = 1 API call, free tier = 25/day total)
+  const DIVIDEND_ENRICH_LIMIT = 8;
+  const PAST_EARNINGS_ENRICH_LIMIT = 6;
+
+  /* ---------- Cache ---------- */
   function readCache() {
     try {
       const raw = localStorage.getItem(CACHE_KEY);
@@ -29,146 +40,193 @@
   }
   function writeCache(data) {
     try {
-      localStorage.setItem(CACHE_KEY, JSON.stringify({
-        savedAt: Date.now(),
-        data
-      }));
+      localStorage.setItem(CACHE_KEY, JSON.stringify({ savedAt: Date.now(), data }));
     } catch {}
   }
+  function clearCache() {
+    try { localStorage.removeItem(CACHE_KEY); } catch {}
+  }
 
-  /* ---------- Yahoo Finance fetchers ---------- */
+  /* ---------- Fetch with proxy chain ---------- */
+  async function fetchTextWithProxies(targetUrl) {
+    let lastErr = null;
+    // Try direct first
+    try {
+      const r = await fetch(targetUrl);
+      if (r.ok) {
+        const txt = await r.text();
+        if (txt && !txt.toLowerCase().startsWith("<!doctype")) return txt;
+      }
+    } catch (e) { lastErr = e; }
 
-  async function fetchWithProxies(targetUrl) {
     for (const proxy of CORS_PROXIES) {
       try {
         const url = proxy + encodeURIComponent(targetUrl);
-        const res = await fetch(url, { method: "GET" });
+        const res = await fetch(url);
         if (!res.ok) continue;
         const txt = await res.text();
-        return JSON.parse(txt);
-      } catch (e) {
-        // try next proxy
-      }
+        if (txt && txt.length > 20) return txt;
+      } catch (e) { lastErr = e; }
     }
-    throw new Error("All CORS proxies failed for " + targetUrl);
+    throw lastErr || new Error("All proxies failed");
   }
 
-  // Yahoo earnings calendar via "quoteSummary" calendarEvents module
-  // Returns next earnings date, EPS estimate, and dividend info
-  async function fetchYahooQuoteSummary(ticker) {
-    const url = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${ticker}?modules=calendarEvents,earnings,defaultKeyStatistics,summaryDetail`;
-    return fetchWithProxies(url);
+  async function fetchJsonWithProxies(targetUrl) {
+    const txt = await fetchTextWithProxies(targetUrl);
+    return JSON.parse(txt);
   }
 
-  /* ---------- Event extraction ---------- */
-
-  function unixToDate(unix) {
-    if (!unix) return null;
-    return new Date(unix * 1000);
+  /* ---------- CSV parser (lightweight) ---------- */
+  function parseCSV(text) {
+    const lines = text.trim().split(/\r?\n/);
+    if (lines.length < 2) return [];
+    const headers = lines[0].split(",").map(h => h.trim());
+    return lines.slice(1).map(line => {
+      const cells = line.split(",");
+      const row = {};
+      headers.forEach((h, i) => row[h] = (cells[i] || "").trim());
+      return row;
+    });
   }
 
-  function extractEventsFromQuote(ticker, name, json) {
+  /* ---------- S&P 500 lookups ---------- */
+  const SP500_SET = new Set((window.SP500_TICKERS || []).map(t => t.ticker));
+  const SP500_NAME = {};
+  (window.SP500_TICKERS || []).forEach(t => SP500_NAME[t.ticker] = t.name);
+
+  /* ---------- Endpoints ---------- */
+
+  // EARNINGS_CALENDAR returns CSV: symbol,name,reportDate,fiscalDateEnding,estimate,currency
+  async function fetchEarningsCalendar() {
+    const url = `https://www.alphavantage.co/query?function=EARNINGS_CALENDAR&horizon=3month&apikey=${API_KEY}`;
+    const csv = await fetchTextWithProxies(url);
+    if (csv.includes("Information") && csv.length < 500) {
+      throw new Error("Rate limited: " + csv.slice(0, 200));
+    }
+    const rows = parseCSV(csv);
     const events = [];
-    if (!json || !json.quoteSummary || !json.quoteSummary.result) return events;
-    const result = json.quoteSummary.result[0];
-    if (!result) return events;
-
-    const cal = result.calendarEvents || {};
-    const earnings = result.earnings || {};
-    const summary = result.summaryDetail || {};
-
-    // ---- Earnings date ----
-    if (cal.earnings && cal.earnings.earningsDate && cal.earnings.earningsDate.length) {
-      const dateRaw = cal.earnings.earningsDate[0];
-      const date = unixToDate(dateRaw && (dateRaw.raw || dateRaw));
-      if (date) {
-        events.push({
-          id: `${ticker}-earnings-${date.toISOString()}`,
-          ticker,
-          name,
-          type: "earnings",
-          date: date.toISOString(),
-          epsEstimate: cal.earnings.earningsAverage ? cal.earnings.earningsAverage.raw : null,
-          epsLow:      cal.earnings.earningsLow     ? cal.earnings.earningsLow.raw : null,
-          epsHigh:     cal.earnings.earningsHigh    ? cal.earnings.earningsHigh.raw : null,
-          revenueEstimate: cal.earnings.revenueAverage ? cal.earnings.revenueAverage.raw : null,
-          // Actual values come from earnings module (past quarters)
-          epsActual: null,
-          revenueActual: null
-        });
-      }
-    }
-
-    // ---- Past earnings (with actual results vs expectations) ----
-    if (earnings.earningsChart && Array.isArray(earnings.earningsChart.quarterly)) {
-      earnings.earningsChart.quarterly.forEach(q => {
-        // q has {date: "1Q2024", actual: {raw}, estimate: {raw}}
-        // We don't have a precise date, so we approximate to mid-quarter
-        // Skipped — these are historical; we focus on upcoming. But we can use them
-        // to enrich the upcoming earnings card with last-quarter context if needed.
+    rows.forEach(r => {
+      if (!r.symbol || !r.reportDate) return;
+      if (!SP500_SET.has(r.symbol)) return; // filter to S&P 500
+      const date = new Date(r.reportDate + "T13:30:00Z");
+      if (isNaN(date.getTime())) return;
+      events.push({
+        id: `${r.symbol}-earnings-${r.reportDate}`,
+        ticker: r.symbol,
+        name: r.name || SP500_NAME[r.symbol] || r.symbol,
+        type: "earnings",
+        date: date.toISOString(),
+        epsEstimate: r.estimate ? parseFloat(r.estimate) : null,
+        epsActual: null,
+        revenueEstimate: null,
+        revenueActual: null,
+        fiscalEnding: r.fiscalDateEnding || null,
+        currency: r.currency || "USD"
       });
-    }
-
-    // ---- Ex-dividend date ----
-    const exDivUnix = cal.exDividendDate && (cal.exDividendDate.raw || cal.exDividendDate);
-    if (exDivUnix) {
-      const date = unixToDate(exDivUnix);
-      if (date) {
-        events.push({
-          id: `${ticker}-exdiv-${date.toISOString()}`,
-          ticker,
-          name,
-          type: "ex-dividend",
-          date: date.toISOString(),
-          dividendRate: summary.dividendRate ? summary.dividendRate.raw : null,
-          dividendYield: summary.dividendYield ? summary.dividendYield.raw : null
-        });
-      }
-    }
-
-    // ---- Dividend payment date ----
-    const divDateUnix = cal.dividendDate && (cal.dividendDate.raw || cal.dividendDate);
-    if (divDateUnix) {
-      const date = unixToDate(divDateUnix);
-      if (date) {
-        events.push({
-          id: `${ticker}-divpay-${date.toISOString()}`,
-          ticker,
-          name,
-          type: "dividend-payment",
-          date: date.toISOString(),
-          dividendRate: summary.dividendRate ? summary.dividendRate.raw : null,
-          dividendYield: summary.dividendYield ? summary.dividendYield.raw : null
-        });
-      }
-    }
-
+    });
     return events;
   }
 
-  /* ---------- Mock data generator (fallback when proxies fail) ---------- */
+  // IPO_CALENDAR returns CSV: symbol,name,ipoDate,priceRangeLow,priceRangeHigh,currency,exchange
+  async function fetchIPOCalendar() {
+    const url = `https://www.alphavantage.co/query?function=IPO_CALENDAR&apikey=${API_KEY}`;
+    const csv = await fetchTextWithProxies(url);
+    if (csv.includes("Information") && csv.length < 500) {
+      throw new Error("Rate limited");
+    }
+    const rows = parseCSV(csv);
+    const events = [];
+    rows.forEach(r => {
+      if (!r.symbol || !r.ipoDate) return;
+      const date = new Date(r.ipoDate + "T13:30:00Z");
+      if (isNaN(date.getTime())) return;
+      const low  = r.priceRangeLow  ? parseFloat(r.priceRangeLow)  : null;
+      const high = r.priceRangeHigh ? parseFloat(r.priceRangeHigh) : null;
+      const mid = (low != null && high != null) ? (low + high) / 2 : (low || high);
+      events.push({
+        id: `${r.symbol}-ipo-${r.ipoDate}`,
+        ticker: r.symbol,
+        name: r.name || r.symbol,
+        type: "ipo",
+        date: date.toISOString(),
+        ipoPrice: mid,
+        priceRangeLow: low,
+        priceRangeHigh: high,
+        exchange: r.exchange || "—",
+        currency: r.currency || "USD"
+      });
+    });
+    return events;
+  }
 
+  // OVERVIEW returns JSON with ExDividendDate and DividendDate
+  async function fetchOverview(ticker) {
+    const url = `https://www.alphavantage.co/query?function=OVERVIEW&symbol=${ticker}&apikey=${API_KEY}`;
+    const json = await fetchJsonWithProxies(url);
+    if (json.Information || json.Note) throw new Error("Rate limited");
+    return json;
+  }
+
+  // EARNINGS returns JSON with quarterlyEarnings: [{ fiscalDateEnding, reportedDate, reportedEPS, estimatedEPS, surprise, surprisePercentage }]
+  async function fetchPastEarnings(ticker) {
+    const url = `https://www.alphavantage.co/query?function=EARNINGS&symbol=${ticker}&apikey=${API_KEY}`;
+    const json = await fetchJsonWithProxies(url);
+    if (json.Information || json.Note) throw new Error("Rate limited");
+    return json;
+  }
+
+  function extractDividendEvents(ticker, name, ov) {
+    const events = [];
+    const exDiv = ov.ExDividendDate;
+    const divDate = ov.DividendDate;
+    const rate = ov.DividendPerShare && ov.DividendPerShare !== "None"
+      ? parseFloat(ov.DividendPerShare) : null;
+    const yld  = ov.DividendYield && ov.DividendYield !== "None"
+      ? parseFloat(ov.DividendYield)   : null;
+
+    if (exDiv && exDiv !== "None" && exDiv !== "0000-00-00") {
+      const d = new Date(exDiv + "T09:30:00Z");
+      if (!isNaN(d.getTime())) {
+        events.push({
+          id: `${ticker}-exdiv-${exDiv}`,
+          ticker, name,
+          type: "ex-dividend",
+          date: d.toISOString(),
+          dividendRate: rate,
+          dividendYield: yld
+        });
+      }
+    }
+    if (divDate && divDate !== "None" && divDate !== "0000-00-00") {
+      const d = new Date(divDate + "T09:30:00Z");
+      if (!isNaN(d.getTime())) {
+        events.push({
+          id: `${ticker}-divpay-${divDate}`,
+          ticker, name,
+          type: "dividend-payment",
+          date: d.toISOString(),
+          dividendRate: rate,
+          dividendYield: yld
+        });
+      }
+    }
+    return events;
+  }
+
+  /* ---------- Mock fallback ---------- */
   function makeMockEvents() {
     const events = [];
     const now = new Date();
-    const types = ["earnings", "ex-dividend", "dividend-payment", "split", "ipo"];
     const tickerData = window.SP500_TICKERS;
+    let s = now.getFullYear() * 1000 + now.getMonth() * 32 + now.getDate();
+    const rand = () => { s = (s * 9301 + 49297) % 233280; return s / 233280; };
 
-    // Seeded pseudo-random for stability across reloads (same day)
-    const seed = now.getFullYear() * 1000 + now.getMonth() * 32 + now.getDate();
-    let s = seed;
-    const rand = () => {
-      s = (s * 9301 + 49297) % 233280;
-      return s / 233280;
-    };
-
-    // Spread events across ~60 days
     for (let i = 0; i < 90; i++) {
       const stock = tickerData[Math.floor(rand() * tickerData.length)];
-      const dayOffset = Math.floor(rand() * 60) - 5; // -5 .. +55 days
+      const dayOffset = Math.floor(rand() * 60) - 5;
       const date = new Date(now);
       date.setDate(date.getDate() + dayOffset);
-      date.setHours(13, 30, 0, 0); // pre-market typical
+      date.setHours(13, 30, 0, 0);
 
       const r = rand();
       let type;
@@ -180,9 +238,7 @@
 
       const ev = {
         id: `${stock.ticker}-${type}-${date.toISOString()}-${i}`,
-        ticker: stock.ticker,
-        name: stock.name,
-        type,
+        ticker: stock.ticker, name: stock.name, type,
         date: date.toISOString()
       };
 
@@ -190,16 +246,12 @@
         const est = +(rand() * 4 + 0.3).toFixed(2);
         const past = dayOffset < 0;
         ev.epsEstimate = est;
-        ev.epsLow = +(est * 0.9).toFixed(2);
-        ev.epsHigh = +(est * 1.1).toFixed(2);
         ev.revenueEstimate = Math.round((rand() * 80 + 5) * 1e9);
         if (past) {
-          // generate actual: usually beats by small amount
           const beatRoll = rand();
-          let actual;
-          if (beatRoll < 0.65) actual = +(est * (1 + rand() * 0.08)).toFixed(2);
-          else if (beatRoll < 0.85) actual = +(est * (1 - rand() * 0.06)).toFixed(2);
-          else actual = est;
+          let actual = beatRoll < 0.65 ? +(est * (1 + rand() * 0.08)).toFixed(2)
+                     : beatRoll < 0.85 ? +(est * (1 - rand() * 0.06)).toFixed(2)
+                     : est;
           ev.epsActual = actual;
           ev.revenueActual = Math.round(ev.revenueEstimate * (0.95 + rand() * 0.12));
         }
@@ -207,64 +259,106 @@
         ev.dividendRate = +(rand() * 4 + 0.2).toFixed(2);
         ev.dividendYield = +(rand() * 0.04 + 0.005).toFixed(4);
       } else if (type === "split") {
-        const ratios = ["2-for-1", "3-for-1", "4-for-1", "10-for-1"];
-        ev.splitRatio = ratios[Math.floor(rand() * ratios.length)];
+        ev.splitRatio = ["2-for-1","3-for-1","4-for-1"][Math.floor(rand() * 3)];
       } else if (type === "ipo") {
         ev.ipoPrice = +(rand() * 50 + 10).toFixed(2);
         ev.exchange = rand() > 0.5 ? "NASDAQ" : "NYSE";
       }
-
       events.push(ev);
     }
     return events;
   }
 
   /* ---------- Main loader ---------- */
-
   async function loadEvents({ useCache = true, onProgress } = {}) {
-    // 1. Check cache
     if (useCache) {
       const cached = readCache();
       if (cached && cached.length) return { events: cached, source: "cache" };
     }
 
-    // 2. Try live Yahoo via proxies — limit to top 30 tickers to avoid hammering
-    const topTickers = window.SP500_TICKERS.slice(0, 30);
     const collected = [];
-    let liveOK = 0;
+    let liveOK = false;
 
-    for (let i = 0; i < topTickers.length; i++) {
-      const t = topTickers[i];
-      if (onProgress) onProgress(i + 1, topTickers.length, t.ticker);
-      try {
-        const json = await fetchYahooQuoteSummary(t.ticker);
-        const evts = extractEventsFromQuote(t.ticker, t.name, json);
-        collected.push(...evts);
-        if (evts.length) liveOK++;
-      } catch (e) {
-        // skip; will fall back if too few succeed
-      }
-      // Tiny throttle so proxies don't rate-limit
-      await new Promise(r => setTimeout(r, 80));
+    // Step 1: Earnings calendar (1 API call, returns hundreds)
+    try {
+      if (onProgress) onProgress("Loading earnings calendar…");
+      const earnings = await fetchEarningsCalendar();
+      collected.push(...earnings);
+      if (earnings.length > 0) liveOK = true;
+    } catch (e) {
+      console.warn("Earnings calendar failed:", e.message);
     }
 
-    if (liveOK >= 5) {
+    // Step 2: IPO calendar (1 API call)
+    try {
+      if (onProgress) onProgress("Loading IPO calendar…");
+      const ipos = await fetchIPOCalendar();
+      collected.push(...ipos);
+      if (ipos.length > 0) liveOK = true;
+    } catch (e) {
+      console.warn("IPO calendar failed:", e.message);
+    }
+
+    // Step 3: Past earnings actuals — for top recent earnings, pull EARNINGS endpoint
+    const today = Date.now();
+    const recentEarnings = collected
+      .filter(e => e.type === "earnings" && new Date(e.date).getTime() < today + 86400000)
+      .sort((a, b) => new Date(b.date) - new Date(a.date))
+      .slice(0, PAST_EARNINGS_ENRICH_LIMIT);
+
+    for (let i = 0; i < recentEarnings.length; i++) {
+      const ev = recentEarnings[i];
+      try {
+        if (onProgress) onProgress(`Past earnings ${ev.ticker} (${i+1}/${recentEarnings.length})`);
+        const past = await fetchPastEarnings(ev.ticker);
+        const q = past.quarterlyEarnings || [];
+        if (q.length) {
+          const target = new Date(ev.date).getTime();
+          const match = q.find(quarterly => {
+            if (!quarterly.reportedDate) return false;
+            const t = new Date(quarterly.reportedDate).getTime();
+            return Math.abs(t - target) < 5 * 86400000;
+          }) || q[0];
+          if (match) {
+            ev.epsActual = match.reportedEPS && match.reportedEPS !== "None"
+              ? parseFloat(match.reportedEPS) : null;
+            if (match.estimatedEPS && match.estimatedEPS !== "None") {
+              ev.epsEstimate = parseFloat(match.estimatedEPS);
+            }
+            if (match.surprisePercentage && match.surprisePercentage !== "None") {
+              ev.surprisePct = parseFloat(match.surprisePercentage);
+            }
+          }
+        }
+      } catch (e) { /* keep going */ }
+      await new Promise(r => setTimeout(r, 100));
+    }
+
+    // Step 4: Dividends — top N S&P 500 tickers
+    const topForDividends = (window.SP500_TICKERS || []).slice(0, DIVIDEND_ENRICH_LIMIT);
+    for (let i = 0; i < topForDividends.length; i++) {
+      const t = topForDividends[i];
+      try {
+        if (onProgress) onProgress(`Dividends ${t.ticker} (${i+1}/${topForDividends.length})`);
+        const ov = await fetchOverview(t.ticker);
+        const divEvents = extractDividendEvents(t.ticker, t.name, ov);
+        collected.push(...divEvents);
+      } catch (e) { /* skip */ }
+      await new Promise(r => setTimeout(r, 100));
+    }
+
+    if (liveOK && collected.length > 5) {
       writeCache(collected);
       return { events: collected, source: "live" };
     }
 
-    // 3. Fallback to mock
-    const mock = makeMockEvents();
-    return { events: mock, source: "demo" };
-  }
-
-  function clearCache() {
-    try { localStorage.removeItem(CACHE_KEY); } catch {}
+    return { events: makeMockEvents(), source: "demo" };
   }
 
   // Expose
   window.MarketAPI = {
     loadEvents,
-    clearCache
+    clearCache,
+    getApiKey: () => API_KEY
   };
 })();
